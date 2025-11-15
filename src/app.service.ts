@@ -1,11 +1,8 @@
-import { Injectable } from '@nestjs/common'; 
-@Injectable() 
-export class AppService { 
-getHealth() { 
-    return { 
-      status: 'ok', 
-      message: 'School ERP API is running', 
-      timestamp: new Date().toISOString(), 
-    }; 
-  } 
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class AppService {
+  getHello(): string {
+    return 'ERP School Management System API';
+  }
 }

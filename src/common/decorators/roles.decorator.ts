@@ -1,8 +1,11 @@
-import { SetMetadata } from '@nestjs/common'; 
-import { UserRole } from '../enums/user-role.enums'; 
-export const ROLES_KEY = 'roles'; 
-/** 
-* Decorator to specify required roles for endpoint 
-* Usage: @Roles(UserRole.ADMIN, UserRole.TEACHER) 
-*/ 
-export const Roles = (...roles: UserRole[]) => SetMetadata(ROLES_KEY, roles); 
+import { SetMetadata } from '@nestjs/common';
+
+export const ROLES_KEY = 'roles';
+export const Roles = (...roles: string[]) => SetMetadata(ROLES_KEY, roles);
+
+export const PERMISSIONS_KEY = 'permissions';
+export const Permissions = (...permissions: string[]) => 
+  SetMetadata(PERMISSIONS_KEY, permissions);
+
+export const MODULES_KEY = 'modules';
+export const Modules = (...modules: string[]) => SetMetadata(MODULES_KEY, modules);

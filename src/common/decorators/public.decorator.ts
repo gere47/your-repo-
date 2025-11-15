@@ -1,7 +1,4 @@
-import { SetMetadata } from '@nestjs/common'; 
-export const IS_PUBLIC_KEY = 'isPublic'; 
-/** 
-* Decorator to mark routes as public (skip JWT authentication) 
-* Usage: @Public() 
-*/ 
+import { SetMetadata } from '@nestjs/common';
+
+export const IS_PUBLIC_KEY = 'isPublic';
 export const Public = () => SetMetadata(IS_PUBLIC_KEY, true);

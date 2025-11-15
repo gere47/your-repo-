@@ -1,275 +1,648 @@
 import { 
-Injectable, 
-UnauthorizedException, 
-BadRequestException, 
-ConflictException, 
-Logger, 
-} from '@nestjs/common'; 
-import { JwtService } from '@nestjs/jwt'; 
-import { ConfigService } from '@nestjs/config'; 
-import { InjectRepository } from '@nestjs/typeorm'; 
-import { Repository } from 'typeorm'; 
-import { User } from './entities/user.entity'; 
-import { Role } from './entities/role.entity'; 
-import { LoginDto } from './dto/login.dto'; 
-import { RegisterDto } from './dto/register.dto'; 
-import { AuthResponseDto, UserResponseDto } from './dto/auth-response.dto'; 
-import { UserStatus } from '../../common/enums/user-status.enum'; 
-import { RESPONSE_MESSAGES } from '../../common/constants/response-messages.constant'; 
-/** 
-* Authentication Service 
-* Handles all authentication logic: login, register, JWT generation 
-*/ 
-@Injectable() 
-export class AuthService { 
-private readonly logger = new Logger(AuthService.name); 
-private readonly MAX_LOGIN_ATTEMPTS = 5; 
-private readonly LOCKOUT_DURATION_MINUTES = 15; 
-constructor(
-    @InjectRepository(User) 
-    private usersRepository: Repository<User>, 
-    @InjectRepository(Role) 
-    private rolesRepository: Repository<Role>, 
-    private jwtService: JwtService, 
-    private configService: ConfigService, 
-  ) {} 
- 
-  /** 
-   * Validate user credentials 
-   * Used by LocalStrategy for email/password authentication 
-   */ 
-  async validateUser(email: string, password: string): Promise<User | null> { 
-    this.logger.log(`Validating credentials for user: ${email}`); 
- 
-    const user = await this.usersRepository.findOne({ 
-      where: { email }, 
-      relations: ['role'], 
-    }); 
- 
-    if (!user) { 
-      this.logger.warn(`User not found: ${email}`); 
-      return null; 
-    } 
- 
-    // Check account status 
-    if (user.status !== UserStatus.ACTIVE) { 
-      throw new UnauthorizedException('Account is not active'); 
-    } 
- 
-    // Check if account is locked 
-    if (user.isAccountLocked()) { 
-      const remainingTime = user.getRemainingLockTime(); 
-      throw new UnauthorizedException( 
-        `Account is locked due to multiple failed login attempts. Try again in ${remainingTime} 
-minutes`, 
-      ); 
-    } 
- 
-    // Validate password 
-    const isPasswordValid = await user.validatePassword(password); 
- 
-    if (!isPasswordValid) { 
-      await this.handleFailedLogin(user); 
-      this.logger.warn(`Invalid password for user: ${email}`); 
-      return null; 
-    } 
- 
-    // Reset failed attempts on successful validation 
-    await this.resetFailedAttempts(user); 
- 
-    this.logger.log(`User validated successfully: ${email}`); 
-    return user; 
-  } 
- 
-  /** 
-   * User login 
-   * Generates JWT tokens and updates last login timestamp 
-   */ 
-  async login(user: User): Promise<AuthResponseDto> { 
-    this.logger.log(`User logging in: ${user.email}`); 
- 
-    const payload = { 
-      sub: user.id, 
-      email: user.email, 
-      role: user.role.name, 
-      permissions: user.role.permissions, 
-    }; 
- 
-    // Generate access token 
-    const accessToken = this.jwtService.sign(payload, { 
-      secret: this.configService.get('JWT_SECRET'), 
-      expiresIn: this.configService.get('JWT_EXPIRES_IN', '1h'), 
-    }); 
- 
-    // Generate refresh token 
-    const refreshToken = this.jwtService.sign( 
-      { sub: user.id }, 
-      { 
-        secret: this.configService.get('JWT_REFRESH_SECRET'), 
-        expiresIn: this.configService.get('JWT_REFRESH_EXPIRES_IN', '7d'), 
-      }, 
-    ); 
- 
-    // Update last login timestamp 
-    await this.usersRepository.update(user.id, { 
-      lastLoginAt: new Date(), 
-    }); 
- 
-    this.logger.log(`Login successful for user: ${user.email}`); 
- 
-    return { 
-      accessToken, 
-      refreshToken, 
-      user: this.formatUserResponse(user), 
-    }; 
-  } 
- 
-  /** 
-   * User registration 
-   * Creates new user with specified role 
-   */ 
-  async register(registerDto: RegisterDto): Promise<User> { 
-    this.logger.log(`Registering new user: ${registerDto.email}`); 
- 
-    // Check if user already exists 
-    const existingUser = await this.usersRepository.findOne({ 
-      where: [ 
-        { email: registerDto.email }, 
-        { username: registerDto.username }, 
-      ], 
-    }); 
- 
-    if (existingUser) { 
-      throw new ConflictException('User with this email or username already exists'); 
-    } 
- 
-    // Verify role exists 
-    const role = await this.rolesRepository.findOne({ 
-      where: { id: registerDto.roleId, isActive: true }, 
-    }); 
- 
-    if (!role) { 
-      throw new BadRequestException('Invalid role specified'); 
-    } 
- 
-    // Create new user 
-    const user = this.usersRepository.create({ 
-      email: registerDto.email, 
-      username: registerDto.username, 
-      passwordHash: registerDto.password, // Will be hashed by @BeforeInsert 
-      role, 
-      status: UserStatus.ACTIVE, 
-      isVerified: false, 
-    }); 
- 
-    const savedUser = await this.usersRepository.save(user); 
- 
-    this.logger.log(`User registered successfully: ${savedUser.email}`); 
- 
-    return savedUser; 
-  } 
- 
-  /** 
-   * Refresh access token 
-   * Generates new access token from refresh token 
-   */ 
-  async refreshToken(refreshToken: string): Promise<{ accessToken: string }> { 
-    try { 
-      const payload = this.jwtService.verify(refreshToken, { 
-        secret: this.configService.get('JWT_REFRESH_SECRET'), 
-      }); 
- 
-      const user = await this.usersRepository.findOne({ 
-        where: { id: payload.sub }, 
-        relations: ['role'], 
-      }); 
- 
-      if (!user || user.status !== UserStatus.ACTIVE) { 
-        throw new UnauthorizedException('Invalid refresh token'); 
-      } 
- 
-      const newPayload = { 
-        sub: user.id, 
-        email: user.email, 
-        role: user.role.name, 
-        permissions: user.role.permissions, 
-      }; 
- 
-      const accessToken = this.jwtService.sign(newPayload, { 
-        secret: this.configService.get('JWT_SECRET'), 
-        expiresIn: this.configService.get('JWT_EXPIRES_IN', '1h'), 
-      }); 
- 
-      return { accessToken }; 
-    } catch (error) { 
-      throw new UnauthorizedException('Invalid or expired refresh token'); 
-    } 
-  } 
- 
-  /** 
-   * Get user profile by ID 
-   */ 
-  async getProfile(userId: string): Promise<User> { 
-    const user = await this.usersRepository.findOne({ 
-      where: { id: userId }, 
-      relations: ['role'], 
-    }); 
- 
-    if (!user) { 
-      throw new UnauthorizedException('User not found'); 
-    } 
- 
-    return user; 
-  } 
- 
-  /** 
-   * Handle failed login attempt 
-   * Increments failed attempts and locks account if threshold reached 
-   */ 
-  private async handleFailedLogin(user: User): Promise<void> { 
-    const attempts = user.failedLoginAttempts + 1; 
-    const updateData: Partial<User> = { failedLoginAttempts: attempts }; 
- 
-    // Lock account after max attempts 
-    if (attempts >= this.MAX_LOGIN_ATTEMPTS) { 
-      const lockUntil = new Date(); 
-      lockUntil.setMinutes(lockUntil.getMinutes() + this.LOCKOUT_DURATION_MINUTES); 
-      updateData.lockedUntil = lockUntil; 
- 
-      this.logger.warn( 
-        `Account locked for user: ${user.email} (${attempts} failed attempts)`, 
-      ); 
-    } 
- 
-    await this.usersRepository.update(user.id, updateData); 
-  } 
- 
-  /** 
-   * Reset failed login attempts 
-   */ 
-  /**
-   * Reset failed login attempts
-   */
-  private async resetFailedAttempts(user: User): Promise<void> {
-    if (user.failedLoginAttempts > 0 || user.lockedUntil) {
-      await this.usersRepository.update(user.id, {
-        failedLoginAttempts: 0,
-        lockedUntil: null as any, // Type assertion for null
+  Injectable, 
+  UnauthorizedException, 
+  ConflictException, 
+  NotFoundException,
+  BadRequestException,
+  InternalServerErrorException
+} from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import { PrismaService } from '../../database/prisma.service';
+import { LoginDto } from './dto/login.dto';
+import { RegisterDto } from './dto/register.dto';
+import { UpdateProfileDto } from './dto/update-profile.dto';
+import { ChangePasswordDto } from './dto/change-password.dto';
+import * as bcrypt from 'bcryptjs';
+import { ConfigService } from '@nestjs/config';
+import { JwtPayload } from '../../common/interfaces/jwt-payload.interface';
+
+@Injectable()
+export class AuthService {
+  constructor(
+    private prisma: PrismaService,
+    private jwtService: JwtService,
+    private configService: ConfigService,
+  ) {}
+
+  async validateUser(username: string, password: string): Promise<any> {
+    try {
+      const user = await this.prisma.user.findFirst({
+        where: {
+          OR: [{ username }, { email: username }],
+          isActive: true,
+        },
+        include: {
+          role: {
+            include: {
+              modulePermissions: {
+                include: {
+                  module: true,
+                },
+                where: {
+                  canView: true,
+                  module: {
+                    isActive: true,
+                  },
+                },
+              },
+            },
+          },
+        },
       });
+
+      if (user && (await bcrypt.compare(password, user.passwordHash))) {
+        const { passwordHash, ...result } = user;
+        
+        // Format accessible modules
+        const accessibleModules = user.role.modulePermissions.map((permission) => ({
+          id: permission.module.id,
+          name: permission.module.name,
+          description: permission.module.description,
+          path: permission.module.path,
+          icon: permission.module.icon,
+          order: permission.module.order,
+          permissions: {
+            canView: permission.canView,
+            canCreate: permission.canCreate,
+            canEdit: permission.canEdit,
+            canDelete: permission.canDelete,
+          },
+        })).sort((a, b) => a.order - b.order);
+
+        return {
+          ...result,
+          accessibleModules,
+        };
+      }
+      return null;
+    } catch (error) {
+      throw new InternalServerErrorException('Authentication service error');
     }
   }
- 
-  /** 
-   * Format user response 
-   */ 
-  private formatUserResponse(user: User): UserResponseDto { 
-    return { 
-      id: user.id, 
-      email: user.email, 
-      username: user.username, 
-      role: user.role.name, 
-      isVerified: user.isVerified, 
-      status: user.status, 
-    }; 
-  } 
+
+  async validateUserById(userId: number): Promise<any> {
+    try {
+      const user = await this.prisma.user.findUnique({
+        where: { id: userId, isActive: true },
+        include: {
+          role: {
+            include: {
+              modulePermissions: {
+                include: {
+                  module: true,
+                },
+                where: {
+                  canView: true,
+                  module: {
+                    isActive: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+      });
+
+      if (user) {
+        const { passwordHash, ...result } = user;
+        
+        // Format accessible modules
+        const accessibleModules = user.role.modulePermissions.map((permission) => ({
+          id: permission.module.id,
+          name: permission.module.name,
+          description: permission.module.description,
+          path: permission.module.path,
+          icon: permission.module.icon,
+          order: permission.module.order,
+          permissions: {
+            canView: permission.canView,
+            canCreate: permission.canCreate,
+            canEdit: permission.canEdit,
+            canDelete: permission.canDelete,
+          },
+        })).sort((a, b) => a.order - b.order);
+
+        return {
+          ...result,
+          accessibleModules,
+        };
+      }
+      return null;
+    } catch (error) {
+      throw new InternalServerErrorException('User validation error');
+    }
+  }
+
+  async login(loginDto: LoginDto, ipAddress?: string, userAgent?: string) {
+    const user = await this.validateUser(loginDto.username, loginDto.password);
+    
+    if (!user) {
+      throw new UnauthorizedException('Invalid username or password');
+    }
+
+    try {
+      // Update last login
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: { lastLogin: new Date() },
+      });
+
+      // Generate JWT token
+      const payload: JwtPayload = { 
+        sub: user.id, 
+        username: user.username,
+        role: user.role.name,
+      };
+
+      const token = this.jwtService.sign(payload, {
+        secret: this.configService.get('jwt.secret'),
+        expiresIn: this.configService.get('jwt.expiresIn'),
+      });
+
+      // Create session
+      const expiresAt = new Date();
+      expiresAt.setHours(expiresAt.getHours() + 24);
+
+      await this.prisma.userSession.create({
+        data: {
+          userId: user.id,
+          token,
+          expiresAt,
+          ipAddress,
+          userAgent,
+        },
+      });
+
+      // Audit log
+      await this.prisma.auditLog.create({
+        data: {
+          userId: user.id,
+          action: 'LOGIN',
+          resource: 'AUTH',
+          ipAddress,
+          userAgent,
+          details: { loginMethod: 'username_password' },
+        },
+      });
+
+      return {
+        access_token: token,
+        token_type: 'Bearer',
+        expires_in: this.configService.get('jwt.expiresIn'),
+        user: {
+          id: user.id,
+          username: user.username,
+          email: user.email,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          phone: user.phone,
+          avatar: user.avatar,
+          role: user.role.name,
+          permissions: user.role.permissions,
+          lastLogin: user.lastLogin,
+          accessibleModules: user.accessibleModules,
+        },
+      };
+    } catch (error) {
+      throw new InternalServerErrorException('Login processing error');
+    }
+  }
+
+  async register(registerDto: RegisterDto) {
+    // Check if user exists
+    const existingUser = await this.prisma.user.findFirst({
+      where: {
+        OR: [
+          { username: registerDto.username },
+          { email: registerDto.email },
+        ],
+      },
+    });
+
+    if (existingUser) {
+      throw new ConflictException('Username or email already exists');
+    }
+
+    // Verify role exists and is not system role
+    const role = await this.prisma.role.findUnique({
+      where: { id: registerDto.roleId },
+    });
+
+    if (!role) {
+      throw new BadRequestException('Invalid role ID');
+    }
+
+    if (role.isSystem && ['super_admin', 'admin'].includes(role.name)) {
+      throw new BadRequestException('Cannot register with system admin role');
+    }
+
+    try {
+      // Hash password
+      const passwordHash = await bcrypt.hash(
+        registerDto.password,
+        this.configService.get('bcrypt.rounds'),
+      );
+
+      // Create user
+      const user = await this.prisma.user.create({
+        data: {
+          username: registerDto.username,
+          email: registerDto.email,
+          passwordHash,
+          firstName: registerDto.firstName,
+          lastName: registerDto.lastName,
+          phone: registerDto.phone,
+          roleId: registerDto.roleId,
+        },
+        include: {
+          role: {
+            include: {
+              modulePermissions: {
+                include: {
+                  module: true,
+                },
+                where: {
+                  canView: true,
+                  module: {
+                    isActive: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+      });
+
+      const { passwordHash: _, ...result } = user;
+
+      // Format accessible modules
+      const accessibleModules = user.role.modulePermissions.map((permission) => ({
+        id: permission.module.id,
+        name: permission.module.name,
+        description: permission.module.description,
+        path: permission.module.path,
+        icon: permission.module.icon,
+        order: permission.module.order,
+        permissions: {
+          canView: permission.canView,
+          canCreate: permission.canCreate,
+          canEdit: permission.canEdit,
+          canDelete: permission.canDelete,
+        },
+      })).sort((a, b) => a.order - b.order);
+
+      // Audit log
+      await this.prisma.auditLog.create({
+        data: {
+          userId: user.id,
+          action: 'CREATE',
+          resource: 'USER',
+          resourceId: user.id,
+          details: { 
+            action: 'USER_REGISTRATION',
+            registeredBy: 'self',
+          },
+        },
+      });
+
+      return {
+        message: 'User registered successfully',
+        user: {
+          ...result,
+          accessibleModules,
+        },
+      };
+    } catch (error) {
+      throw new InternalServerErrorException('User registration failed');
+    }
+  }
+
+  async getProfile(userId: number) {
+    try {
+      const user = await this.prisma.user.findUnique({
+        where: { id: userId, isActive: true },
+        include: {
+          role: {
+            include: {
+              modulePermissions: {
+                include: {
+                  module: true,
+                },
+                where: {
+                  canView: true,
+                  module: {
+                    isActive: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+      });
+
+      if (!user) {
+        throw new NotFoundException('User not found');
+      }
+
+      const { passwordHash, ...result } = user;
+
+      // Format accessible modules
+      const accessibleModules = user.role.modulePermissions.map((permission) => ({
+        id: permission.module.id,
+        name: permission.module.name,
+        description: permission.module.description,
+        path: permission.module.path,
+        icon: permission.module.icon,
+        order: permission.module.order,
+        permissions: {
+          canView: permission.canView,
+          canCreate: permission.canCreate,
+          canEdit: permission.canEdit,
+          canDelete: permission.canDelete,
+        },
+      })).sort((a, b) => a.order - b.order);
+
+      return {
+        ...result,
+        accessibleModules,
+      };
+    } catch (error) {
+      throw new InternalServerErrorException('Profile retrieval failed');
+    }
+  }
+
+  async updateProfile(userId: number, updateProfileDto: UpdateProfileDto) {
+    // Check if email is taken by another user
+    if (updateProfileDto.email) {
+      const existingUser = await this.prisma.user.findFirst({
+        where: {
+          email: updateProfileDto.email,
+          id: { not: userId },
+        },
+      });
+
+      if (existingUser) {
+        throw new ConflictException('Email already taken by another user');
+      }
+    }
+
+    try {
+      const user = await this.prisma.user.update({
+        where: { id: userId },
+        data: updateProfileDto,
+        include: {
+          role: {
+            include: {
+              modulePermissions: {
+                include: {
+                  module: true,
+                },
+                where: {
+                  canView: true,
+                  module: {
+                    isActive: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+      });
+
+      const { passwordHash, ...result } = user;
+
+      // Format accessible modules
+      const accessibleModules = user.role.modulePermissions.map((permission) => ({
+        id: permission.module.id,
+        name: permission.module.name,
+        description: permission.module.description,
+        path: permission.module.path,
+        icon: permission.module.icon,
+        order: permission.module.order,
+        permissions: {
+          canView: permission.canView,
+          canCreate: permission.canCreate,
+          canEdit: permission.canEdit,
+          canDelete: permission.canDelete,
+        },
+      })).sort((a, b) => a.order - b.order);
+
+      // Audit log
+      await this.prisma.auditLog.create({
+        data: {
+          userId,
+          action: 'UPDATE',
+          resource: 'PROFILE',
+          resourceId: userId,
+          details: { updatedFields: Object.keys(updateProfileDto) },
+        },
+      });
+
+      return {
+        message: 'Profile updated successfully',
+        user: {
+          ...result,
+          accessibleModules,
+        },
+      };
+    } catch (error) {
+      throw new InternalServerErrorException('Profile update failed');
+    }
+  }
+
+  async changePassword(userId: number, changePasswordDto: ChangePasswordDto) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+    });
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    // Verify current password
+    const isCurrentPasswordValid = await bcrypt.compare(
+      changePasswordDto.currentPassword,
+      user.passwordHash,
+    );
+
+    if (!isCurrentPasswordValid) {
+      throw new UnauthorizedException('Current password is incorrect');
+    }
+
+    try {
+      // Hash new password
+      const newPasswordHash = await bcrypt.hash(
+        changePasswordDto.newPassword,
+        this.configService.get('bcrypt.rounds'),
+      );
+
+      // Update password
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: { passwordHash: newPasswordHash },
+      });
+
+      // Invalidate all sessions except current
+      await this.prisma.userSession.updateMany({
+        where: {
+          userId,
+          isActive: true,
+        },
+        data: { isActive: false },
+      });
+
+      // Audit log
+      await this.prisma.auditLog.create({
+        data: {
+          userId,
+          action: 'UPDATE',
+          resource: 'PASSWORD',
+          resourceId: userId,
+        },
+      });
+
+      return { message: 'Password changed successfully' };
+    } catch (error) {
+      throw new InternalServerErrorException('Password change failed');
+    }
+  }
+
+  async logout(token: string) {
+    try {
+      await this.prisma.userSession.updateMany({
+        where: { token },
+        data: { isActive: false },
+      });
+
+      return { message: 'Logged out successfully' };
+    } catch (error) {
+      throw new InternalServerErrorException('Logout failed');
+    }
+  }
+
+  async logoutAll(userId: number) {
+    try {
+      await this.prisma.userSession.updateMany({
+        where: { userId, isActive: true },
+        data: { isActive: false },
+      });
+
+      // Audit log
+      await this.prisma.auditLog.create({
+        data: {
+          userId,
+          action: 'LOGOUT',
+          resource: 'ALL_SESSIONS',
+          resourceId: userId,
+        },
+      });
+
+      return { message: 'Logged out from all devices' };
+    } catch (error) {
+      throw new InternalServerErrorException('Logout all failed');
+    }
+  }
+
+  async deleteUser(userId: number, currentUserId: number) {
+    if (userId === currentUserId) {
+      throw new BadRequestException('You cannot delete your own account');
+    }
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      include: { role: true },
+    });
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    // Prevent deletion of system admin users
+    if (user.role.isSystem && ['super_admin', 'admin'].includes(user.role.name)) {
+      throw new BadRequestException('Cannot delete system administrator accounts');
+    }
+
+    try {
+      // Soft delete user
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: { isActive: false },
+      });
+
+      // Invalidate all sessions
+      await this.prisma.userSession.updateMany({
+        where: { userId },
+        data: { isActive: false },
+      });
+
+      // Audit log
+      await this.prisma.auditLog.create({
+        data: {
+          userId: currentUserId,
+          action: 'DELETE',
+          resource: 'USER',
+          resourceId: userId,
+          details: { deletedBy: currentUserId },
+        },
+      });
+
+      return { message: 'User deleted successfully' };
+    } catch (error) {
+      throw new InternalServerErrorException('User deletion failed');
+    }
+  }
+
+  async getActiveSessions(userId: number) {
+    try {
+      const sessions = await this.prisma.userSession.findMany({
+        where: {
+          userId,
+          isActive: true,
+          expiresAt: { gt: new Date() },
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+
+      return sessions;
+    } catch (error) {
+      throw new InternalServerErrorException('Sessions retrieval failed');
+    }
+  }
+
+  async refreshToken(userId: number) {
+    try {
+      const user = await this.validateUserById(userId);
+      if (!user) {
+        throw new UnauthorizedException('User not found');
+      }
+
+      const payload: JwtPayload = { 
+        sub: user.id, 
+        username: user.username,
+        role: user.role.name,
+      };
+
+      const token = this.jwtService.sign(payload, {
+        secret: this.configService.get('jwt.secret'),
+        expiresIn: this.configService.get('jwt.expiresIn'),
+      });
+
+      // Update session
+      const expiresAt = new Date();
+      expiresAt.setHours(expiresAt.getHours() + 24);
+
+      await this.prisma.userSession.updateMany({
+        where: { userId, isActive: true },
+        data: { token, expiresAt },
+      });
+
+      return {
+        access_token: token,
+        token_type: 'Bearer',
+        expires_in: this.configService.get('jwt.expiresIn'),
+      };
+    } catch (error) {
+      throw new InternalServerErrorException('Token refresh failed');
+    }
+  }
 }

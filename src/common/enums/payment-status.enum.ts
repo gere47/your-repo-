@@ -1,7 +1,0 @@
-export enum PaymentStatus { 
-PENDING = 'PENDING', 
-PAID = 'PAID', 
-PARTIAL = 'PARTIAL', 
-OVERDUE = 'OVERDUE', 
-CANCELLED = 'CANCELLED', 
-} 
